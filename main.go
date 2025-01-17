@@ -130,7 +130,17 @@ func leafInsert(new BNode, old BNode, idx uint16, key []byte, val []byte) {
 }
 
 func leafUpdate(new BNode, old BNode, idx uint16, key []byte, val []byte) {
-	// TODO
+	// set the header for the new node
+	new.setHeader(BNODE_LEAF, old.nkeys())
+
+	// copy all existing k-v pairs from old node to the new node
+	nodeAppendRange(new, old, 0, 0, idx) // copy keys before updated key
+
+	// Update the specific k-v pair at index idx
+	nodeAppendKV(new, idx, old.getPtr(idx), key, val)
+
+	// copy remaining k-v from old node after the updated key
+	nodeAppendRange(new, old, idx+1, idx+1, old.nkeys()-idx-1)
 }
 
 // copy a KV into the position
@@ -153,9 +163,14 @@ func nodeAppendRange(
 	dstNew uint16, srcOld uint16, n uint16,
 ) {
 	for i := uint16(0); i < n; i++ {
-		nodeAppendKV(new, dstNew, 0, old.getKey(srcOld), old.getValue(srcOld))
-		srcOld++
-		dstNew++
+		// calculate the index in the old node
+		oldIdx := srcOld + i
+		// Get the key/value from old node
+		key := old.getKey(oldIdx)
+		value := old.getValue(oldIdx)
+
+		// Append the k-v pair to the new node
+		nodeAppendKV(new, dstNew+i, 0, key, value)
 	}
 }
 
@@ -175,7 +190,29 @@ func nodeReplaceKidN(
 
 // split a oversized node into 2 so that the 2nd node always fits on a page
 func nodeSplit2(left BNode, right BNode, old BNode) {
-	// TODO
+	// determine the no of keys in the old node
+	nkeys := old.nkeys()
+
+	// calculate the midpoint for splitting
+	mid := nkeys / 2
+
+	// set up the left node with 1st half of the keys
+	left.setHeader(old.btype(), mid)
+	for i := uint16(0); i < mid; i++ {
+		key := old.getKey(i)
+		val := old.getValue(i)
+		ptr := old.getPtr(i)
+		nodeAppendKV(left, i, ptr, key, val)
+	}
+
+	// set up the right node with 2nd half of the keys
+	right.setHeader(old.btype(), nkeys-mid)
+	for i := mid; i < nkeys; i++ {
+		key := old.getKey(i)
+		val := old.getValue(i)
+		ptr := old.getPtr(i)
+		nodeAppendKV(right, i-mid, ptr, key, val)
+	}
 }
 
 // split a node if its too big, the results are 1-3 nodes
