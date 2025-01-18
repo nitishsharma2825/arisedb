@@ -280,3 +280,177 @@ func nodeInsert(
 	// update the kid links
 	nodeReplaceKidN(tree, new, node, idx, split[:nsplit]...)
 }
+
+func (tree *Btree) Insert(key []byte, val []byte) {
+	if tree.root == 0 {
+		// create the first node
+		root := BNode(make([]byte, BTREE_PAGE_SIZE))
+		root.setHeader(BNODE_LEAF, 2)
+		// a dummy key, this makes the tree cover the whole key space
+		nodeAppendKV(root, 0, 0, nil, nil)
+		nodeAppendKV(root, 1, 0, key, val)
+		tree.root = tree.new(root)
+		return
+	}
+
+	node := treeInsert(tree, tree.get(tree.root), key, val)
+	nsplit, split := nodeSplit3(node)
+	tree.del(tree.root)
+	if nsplit > 1 {
+		// the root was split, add a new level
+		root := BNode(make([]byte, BTREE_PAGE_SIZE))
+		root.setHeader(BNODE_NODE, nsplit)
+		for i, knode := range split[:nsplit] {
+			ptr, key := tree.new(knode), knode.getKey(0)
+			nodeAppendKV(root, uint16(i), ptr, key, nil)
+		}
+		tree.root = tree.new(root)
+	} else {
+		tree.root = tree.new(split[0])
+	}
+}
+
+// remove a key from a leaf node
+func leafDelete(new BNode, old BNode, idx uint16) {
+	new.setHeader(BNODE_LEAF, old.nkeys()-1)
+
+	// copy all keys and value before the index
+	nodeAppendRange(new, old, 0, 0, idx)
+
+	// skip the key at idx (the one to be deleted)
+	nodeAppendRange(new, old, idx, idx+1, old.nkeys()-idx-1)
+}
+
+// merge 2 nodes into 1
+func nodeMerge(new BNode, left BNode, right BNode) {
+	new.setHeader(left.btype(), left.nkeys()+right.nkeys())
+
+	for i := uint16(0); i < left.nkeys(); i++ {
+		key := left.getKey(i)
+		val := left.getValue(i)
+		ptr := left.getPtr(i)
+		nodeAppendKV(new, i, ptr, key, val)
+	}
+
+	for i := uint16(0); i < right.nkeys(); i++ {
+		key := left.getKey(i)
+		val := left.getValue(i)
+		ptr := left.getPtr(i)
+		nodeAppendKV(new, i, ptr, key, val)
+	}
+}
+
+// replace 2 adjacent links with 1
+func nodeReplace2Kid(
+	new BNode, old BNode, idx uint16, ptr uint64, key []byte,
+) {
+	new.setHeader(old.btype(), old.nkeys()-1)
+
+	// copy all existing keys and pointers before idx
+	nodeAppendRange(new, old, 0, 0, idx)
+
+	// append merged pointer at index idx
+	new.setPtr(idx, ptr)
+
+	// copy remaining keys and pointers after idx + 1
+	nodeAppendRange(new, old, idx+1, idx+2, old.nkeys()-(idx+2))
+}
+
+// should the updated kid be merged with a sibling?
+func shouldMerge(
+	tree *Btree, node BNode,
+	idx uint16, updated BNode,
+) (int, BNode) {
+	if updated.nbytes() > BTREE_PAGE_SIZE/4 {
+		return 0, BNode{}
+	}
+
+	if idx > 0 {
+		sibling := BNode(tree.get(node.getPtr(idx - 1)))
+		merged := sibling.nbytes() + updated.nbytes() - HEADER
+		if merged <= BTREE_PAGE_SIZE {
+			return -1, sibling // left
+		}
+	}
+
+	if idx+1 < node.nkeys() {
+		sibling := BNode(tree.get(node.getPtr(idx + 1)))
+		merged := sibling.nbytes() + updated.nbytes() - HEADER
+		if merged <= BTREE_PAGE_SIZE {
+			return +1, sibling // right
+		}
+	}
+	return 0, BNode{}
+}
+
+// delete a key from the tree
+func treeDelete(tree *Btree, node BNode, key []byte) BNode {
+	// find the index where the key should be located
+	idx := nodeLookupLE(node, key)
+
+	switch node.btype() {
+	case BNODE_LEAF:
+		// If we are at a leaf node, attempt to delete the key
+		if idx < node.nkeys() && bytes.Equal(key, node.getKey(idx)) {
+			// key found in leaf, perform deletion
+			newLeaf := BNode(make([]byte, 2*BTREE_PAGE_SIZE)) // new leaf node for COW
+			leafDelete(newLeaf, node, idx)
+			return newLeaf
+		} else {
+			// key not found in this leaf; nothing to delete
+			return node
+		}
+	case BNODE_NODE:
+		// If we are at an internal node, descend to the appropriate child
+		kptr := node.getPtr(idx)
+		childNode := tree.get(kptr)
+
+		// Recursively delete from the child node
+		newChild := treeDelete(tree, childNode, key)
+
+		// Check if we need to update the pointer in the parent node
+		if len(newChild) != len(childNode) || cap(newChild) != cap(childNode) || &newChild[0] != &childNode[0] {
+			// A new child was returned due to deletion
+			newInternal := BNode(make([]byte, 2*BTREE_PAGE_SIZE))   // new internal node for COW
+			nodeReplaceKidN(tree, newInternal, node, idx, newChild) // update pointer in parent
+			return newInternal
+		}
+
+		return node
+	default:
+		panic("bad type")
+	}
+}
+
+// delete a key from an internal node; part of the treeDelete
+func nodeDelete(tree *Btree, node BNode, idx uint16, key []byte) BNode {
+	// recurse into the kid
+	kptr := node.getPtr(idx)
+	updated := treeDelete(tree, tree.get(kptr), key)
+	if len(updated) == 0 {
+		return BNode{} // not found
+	}
+	tree.del(kptr)
+
+	new := BNode(make([]byte, BTREE_PAGE_SIZE))
+	// check for merging
+	mergeDir, sibling := shouldMerge(tree, node, idx, updated)
+	switch {
+	case mergeDir < 0: // left
+		merged := BNode(make([]byte, BTREE_PAGE_SIZE))
+		nodeMerge(merged, sibling, updated)
+		tree.del(node.getPtr(idx - 1))
+		nodeReplace2Kid(new, node, idx-1, tree.new(merged), merged.getKey(0))
+	case mergeDir > 0: // right
+		merged := BNode(make([]byte, BTREE_PAGE_SIZE))
+		nodeMerge(merged, sibling, updated)
+		tree.del(node.getPtr(idx + 1))
+		nodeReplace2Kid(new, node, idx, tree.new(merged), merged.getKey(0))
+	case mergeDir == 0 && updated.nkeys() == 0:
+		new.setHeader(BNODE_NODE, 0)
+	case mergeDir == 0 && updated.nkeys() > 0: // no merge
+		nodeReplaceKidN(tree, new, node, idx, updated)
+	}
+
+	return new
+}
