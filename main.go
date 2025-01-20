@@ -3,7 +3,12 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
+	"internal/syscall/unix"
 	"log"
+	"os"
+	"path"
+	"syscall"
 )
 
 const HEADER = 4
@@ -30,8 +35,8 @@ type Btree struct {
 	// pointer (a nonzero page number)
 	root uint64
 	// callbacks for managing on-disk pages
-	get func(uint64) []byte // dereference a pointer
-	new func([]byte) uint64 // allocate a page
+	get func(uint64) []byte // read a page
+	new func([]byte) uint64 // append a page
 	del func(uint64)        // deallocate a page
 }
 
@@ -281,6 +286,7 @@ func nodeInsert(
 	nodeReplaceKidN(tree, new, node, idx, split[:nsplit]...)
 }
 
+// insert a new key or update an existing key
 func (tree *Btree) Insert(key []byte, val []byte) {
 	if tree.root == 0 {
 		// create the first node
@@ -309,6 +315,9 @@ func (tree *Btree) Insert(key []byte, val []byte) {
 		tree.root = tree.new(split[0])
 	}
 }
+
+// deleteakeyandreturnswhetherthekeywasthere
+func (tree *Btree) Delete(key []byte) bool
 
 // remove a key from a leaf node
 func leafDelete(new BNode, old BNode, idx uint16) {
@@ -453,4 +462,140 @@ func nodeDelete(tree *Btree, node BNode, idx uint16, key []byte) BNode {
 	}
 
 	return new
+}
+
+// KV store with COW B+tree backed by a file
+type KV struct {
+	Path string // file name
+	// internals
+	fd   int
+	tree Btree
+	mmap struct {
+		total  int      // mmap size, can be larger than the file size
+		chunks [][]byte // multiple mmaps, can be non-continuous
+	}
+	page struct {
+		flushed uint64   // database size in number of pages
+		temp    [][]byte // newly allocated pages
+	}
+}
+
+// Btree.get, read a page
+func (db *KV) pageRead(ptr uint64) []byte {
+	start := uint64(0)
+	for _, chunk := range db.mmap.chunks {
+		end := start + uint64(len(chunk))/BTREE_PAGE_SIZE
+		if ptr < end {
+			offset := BTREE_PAGE_SIZE * (ptr - start)
+			return chunk[offset : offset+BTREE_PAGE_SIZE]
+		}
+		start = end
+	}
+	panic("bad ptr")
+}
+
+func writePages(db *KV) error {
+	// extend the mmap if needed
+	size := (int(db.page.flushed) + len(db.page.temp)) * BTREE_PAGE_SIZE
+	if err := extendMmap(db, size); err != nil {
+		return err
+	}
+	// write data pages to the file
+	offset := int64(db.page.flushed * BTREE_PAGE_SIZE)
+	if _, err := unix.Pwritev(db.fd, db.page.temp, offset); err != nil {
+		return err
+	}
+	// discard in-memory data
+	db.page.flushed += uint64(len(db.page.temp))
+	db.page.temp = db.page.temp[:0]
+	return nil
+}
+
+func (db *KV) pageAppend(node []byte) uint64 {
+	ptr := db.page.flushed + uint64(len(db.page.temp)) // just append
+	db.page.temp = append(db.page.temp, node)
+	return ptr
+}
+
+func (db *KV) Open() error {
+	db.tree.get = db.pageRead   // read a page
+	db.tree.new = db.pageAppend // append a page
+	db.tree.del = func(uint64) {}
+	return nil
+}
+
+func (db *KV) Get(key []byte) ([]byte, bool) {
+	return db.tree.Get(key)
+}
+
+func (db *KV) Set(key []byte, val []byte) error {
+	db.tree.Insert(key, val)
+	return updateFile(db)
+}
+
+func (db *KV) Del(key []byte) (bool, error) {
+	deleted := db.tree.Delete(key)
+	return deleted, updateFile(db)
+}
+
+func updateFile(db *KV) error {
+	// 1. Write new nodes
+	if err := writePages(db); err != nil {
+		return err
+	}
+	// 2. fsync to enforce the order between 1 and 3
+	if err := syscall.Fsync(db.fd); err != nil {
+		return err
+	}
+	// 3. Update the root pointer atomically
+	if err := updateRoot(db); err != nil {
+		return err
+	}
+	// 4. fsync to make everything persistent
+	return syscall.Fsync(db.fd)
+}
+
+func createFileSync(file string) (int, error) {
+	// obtain the directory fd
+	flags := os.O_RDONLY | syscall.O_DIRECTORY
+	dirfd, err := syscall.Open(path.Dir(file), flags, 0o644)
+	if err != nil {
+		return -1, fmt.Errorf("open directory: %w", err)
+	}
+	defer syscall.Close(dirfd)
+
+	// open or create the file
+	flags = os.O_RDWR | os.O_CREATE
+	fd, err := syscall.Openat(dirfd, path.Base(file), flags, 0o644)
+	if err != nil {
+		return -1, fmt.Errorf("open file: %w", err)
+	}
+
+	// fsync the directory
+	if err = syscall.Fsync(dirfd); err != nil {
+		_ = syscall.Close(fd) // may leave an empty file
+		return -1, fmt.Errorf("fsync directory: %w", err)
+	}
+
+	return fd, nil
+}
+
+func extendMmap(db *KV, size int) error {
+	if size <= db.mmap.total {
+		return nil // enough range
+	}
+	alloc := max(db.mmap.total, 64<<20) // double the current address space
+	for db.mmap.total+alloc < size {
+		alloc *= 2 // still not enough?
+	}
+	chunk, err := syscall.Mmap(
+		db.fd, int64(db.mmap.total), alloc,
+		syscall.PROT_READ, syscall.MAP_SHARED, // read-only
+	)
+	if err != nil {
+		return fmt.Errorf("mmap: %w", err)
+	}
+	db.mmap.total += alloc
+	db.mmap.chunks = append(db.mmap.chunks, chunk)
+	return nil
 }
