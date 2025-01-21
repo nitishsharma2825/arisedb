@@ -17,6 +17,8 @@ const BTREE_PAGE_SIZE = 4096
 const BTREE_MAX_KEY_SIZE = 1000
 const BTREE_MAX_VAL_SIZE = 3000
 
+const DB_SIG = "BuildYourOwnDB06"
+
 const (
 	BNODE_NODE = 1 // internal nodes without values
 	BNODE_LEAF = 2 // leaf node with values
@@ -478,6 +480,7 @@ type KV struct {
 		flushed uint64   // database size in number of pages
 		temp    [][]byte // newly allocated pages
 	}
+	failed bool // Did the last update failed?
 }
 
 // Btree.get, read a page
@@ -529,8 +532,9 @@ func (db *KV) Get(key []byte) ([]byte, bool) {
 }
 
 func (db *KV) Set(key []byte, val []byte) error {
+	meta := saveMeta(db) // save the in memory state
 	db.tree.Insert(key, val)
-	return updateFile(db)
+	return updateOrRevert(db, meta)
 }
 
 func (db *KV) Del(key []byte) (bool, error) {
@@ -599,3 +603,74 @@ func extendMmap(db *KV, size int) error {
 	db.mmap.chunks = append(db.mmap.chunks, chunk)
 	return nil
 }
+
+// |sig |root_ptr|page_used|
+// |16B | 8B | 8B |
+func saveMeta(db *KV) []byte {
+	var data [32]byte
+	copy(data[:16], []byte(DB_SIG))
+	binary.LittleEndian.PutUint64(data[16:], db.tree.root)
+	binary.LittleEndian.PutUint64(data[24:], db.page.flushed)
+	return data[:]
+}
+
+func loadMeta(db *KV, data []byte) {
+	// Load the root pointer
+	db.tree.root = binary.NativeEndian.Uint64(data[16:24])
+	// Load the page flushed value
+	db.page.flushed = binary.NativeEndian.Uint64(data[24:32])
+}
+
+func readRoot(db *KV, fileSize int64) error {
+	if fileSize == 0 { // empty file
+		db.page.flushed = 1 // the meta page is initialized on the 1st write
+		return nil
+	}
+	// read the page
+	data := db.mmap.chunks[0]
+	loadMeta(db, data)
+	// verify the page
+	// ...
+	return nil
+}
+
+// Update the meta page. it must be atomic
+func updateRoot(db *KV) error {
+	if _, err := syscall.Pwrite(db.fd, saveMeta(db), 0); err != nil {
+		return fmt.Errorf("write meta page: %w", err)
+	}
+	return nil
+}
+
+func updateOrRevert(db *KV, meta []byte) error {
+	// ensure the on-disk meta page matches the in-memory one after an error
+	if db.failed {
+		// write the sync the previous meta page
+		db.failed = false
+	}
+	// 2-phase update
+	err := updateFile(db)
+	// revert an error
+	if err != nil {
+		// the on-disk meta page is in unknown state
+		// mark it to be rewritten on later recovery.
+		db.failed = true
+		// the in-memory states can be reverted immediately to allow reads
+		loadMeta(db, meta)
+		// discard temps
+		db.page.temp = db.page.temp[:0]
+	}
+	return err
+}
+
+// node foramt:
+type LNode []byte
+
+const FREE_LIST_HEADER = 8
+const FREE_LIST_CAP = (BTREE_PAGE_SIZE - FREE_LIST_HEADER) / 8
+
+// getters and setters
+func (node LNode) getNext() uint64
+func (node LNode) setNext(next uint64)
+func (node LNode) getPtr(idx int) uint64
+func (node LNode) setPtr(idx int, ptr uint64)
