@@ -472,29 +472,25 @@ type KV struct {
 	// internals
 	fd   int
 	tree Btree
+	free FreeList
 	mmap struct {
 		total  int      // mmap size, can be larger than the file size
 		chunks [][]byte // multiple mmaps, can be non-continuous
 	}
 	page struct {
-		flushed uint64   // database size in number of pages
-		temp    [][]byte // newly allocated pages
+		flushed uint64          // database size in number of pages
+		nappend uint64          // number of pages to be appended
+		updates map[uint64]byte // pending updates, including appended pages
 	}
 	failed bool // Did the last update failed?
 }
 
 // Btree.get, read a page
 func (db *KV) pageRead(ptr uint64) []byte {
-	start := uint64(0)
-	for _, chunk := range db.mmap.chunks {
-		end := start + uint64(len(chunk))/BTREE_PAGE_SIZE
-		if ptr < end {
-			offset := BTREE_PAGE_SIZE * (ptr - start)
-			return chunk[offset : offset+BTREE_PAGE_SIZE]
-		}
-		start = end
+	if node, ok := db.page.updates[ptr]; ok {
+		return node
 	}
-	panic("bad ptr")
+	return db.pageReadFile(ptr)
 }
 
 func writePages(db *KV) error {
@@ -521,9 +517,13 @@ func (db *KV) pageAppend(node []byte) uint64 {
 }
 
 func (db *KV) Open() error {
-	db.tree.get = db.pageRead   // read a page
-	db.tree.new = db.pageAppend // append a page
-	db.tree.del = func(uint64) {}
+	db.tree.get = db.pageRead      // read a page
+	db.tree.new = db.pageAlloc     // reuse from the free list or append
+	db.tree.del = db.free.PushTail // freed pages go to the free list
+	// free list callbacks
+	db.free.get = db.pageRead   // read a page
+	db.free.new = db.pageAppend // append a page
+	db.free.set = db.pageWrite  // in-place update
 	return nil
 }
 
@@ -556,7 +556,11 @@ func updateFile(db *KV) error {
 		return err
 	}
 	// 4. fsync to make everything persistent
-	return syscall.Fsync(db.fd)
+	syscall.Fsync(db.fd)
+
+	// prepare the free list for the next update
+	db.free.SetMaxSeq()
+	return nil
 }
 
 func createFileSync(file string) (int, error) {
@@ -604,8 +608,9 @@ func extendMmap(db *KV, size int) error {
 	return nil
 }
 
-// |sig |root_ptr|page_used|
-// |16B | 8B | 8B |
+// |sig|root_ptr|page_used|head_page|head_seq|tail_page|tail_seq|
+//
+// |16B| 8B | 8B | 8B | 8B | 8B | 8B |
 func saveMeta(db *KV) []byte {
 	var data [32]byte
 	copy(data[:16], []byte(DB_SIG))
@@ -623,7 +628,11 @@ func loadMeta(db *KV, data []byte) {
 
 func readRoot(db *KV, fileSize int64) error {
 	if fileSize == 0 { // empty file
-		db.page.flushed = 1 // the meta page is initialized on the 1st write
+		// reserve 2 pages; the meta page and a free list node
+		db.page.flushed = 2
+		// add an initial node to the free list so its never empty
+		db.free.headPage = 1 // 2nd page
+		db.free.tailPage = 1
 		return nil
 	}
 	// read the page
@@ -674,3 +683,109 @@ func (node LNode) getNext() uint64
 func (node LNode) setNext(next uint64)
 func (node LNode) getPtr(idx int) uint64
 func (node LNode) setPtr(idx int, ptr uint64)
+
+type FreeList struct {
+	// callbacks for managing on-disk pages
+	get func(uint64) []byte // read a page
+	new func([]byte) uint64 // append a new page
+	set func(uint64) []byte // update an existing page
+	// persisted data in the meta page
+	headPage uint64 // pointer to the list head node
+	headSeq  uint64 // monotonic seq number to index into the list head
+	tailPage uint64
+	tailSeq  uint64 // monotonic seq number to index into the list tail
+	// in-memory states
+	maxSeq uint64 // saved 'tailSeq' to prevent consuming newly added items
+}
+
+// get 1 item from the list head. return 0 on failure
+func (f1 *FreeList) PopHead() uint64
+
+// add 1 item to the tail
+func (fl *FreeList) PushTail(ptr uint64) {
+	// add it to the tail node
+	LNode(fl.set(fl.tailPage)).setPtr(seq2idx(fl.tailSeq), ptr)
+	fl.tailSeq++
+	// add a new tail node if its full
+	if seq2idx(fl.tailSeq) == 0 {
+		// try to reuse from the list head
+		next, head := flPop(fl)
+		if next == 0 {
+			// or allocate a new node by appending
+			next = fl.new(make([]byte, BTREE_PAGE_SIZE))
+		}
+		// link to the new tail node
+		LNode(fl.set(fl.tailPage)).setNext(next)
+		fl.tailPage = next
+		// also add the head node if its removed
+		if head != 0 {
+			LNode(fl.set(fl.tailPage)).setPtr(0, head)
+			fl.tailSeq++
+		}
+	}
+}
+
+func seq2idx(seq uint64) int {
+	return int(seq % FREE_LIST_CAP)
+}
+
+func (fl *FreeList) SetMaxSeq() {
+	fl.maxSeq = fl.tailSeq
+}
+
+// remove 1 item from the head node, and remove the head node if empty
+func flPop(fl *FreeList) (ptr uint64, head uint64) {
+	if fl.headSeq == fl.maxSeq {
+		return 0, 0 // can't advance
+	}
+
+	node := LNode(fl.get(fl.headPage))
+	ptr = node.getPtr(seq2idx(fl.headSeq))
+	fl.headSeq++
+	// move to the next one if the head node is empty
+	if seq2idx(fl.headSeq) == 0 {
+		head, fl.headPage = fl.headPage, node.getNext()
+	}
+	return
+}
+
+// get 1 item from the list head. return 0 on failure
+func (fl *FreeList) PopHead() uint64 {
+	ptr, head := flPop(fl)
+	if head != 0 { // the empty head node is recycled
+		fl.PushTail(head)
+	}
+	return ptr
+}
+
+func (db *KV) pageAlloc(node []byte) uint64 {
+	if ptr := db.free.PopHead(); ptr != 0 {
+		db.page.updates[ptr] = node
+		return ptr
+	}
+	return db.pageAppend(node)
+}
+
+func (db *KV) pageWrite(ptr uint64) []byte {
+	if node, ok := db.page.updates[ptr]; ok {
+		return node
+	}
+	node := make([]byte, BTREE_PAGE_SIZE)
+	copy(node, db.pageReadFile(ptr))
+	db.page.updates[ptr] = node
+	return node
+}
+
+func (db *KV) pageReadFile(ptr uint64) []byte {
+	// same as KV.pageRead
+	start := uint64(0)
+	for _, chunk := range db.mmap.chunks {
+		end := start + uint64(len(chunk))/BTREE_PAGE_SIZE
+		if ptr < end {
+			offset := BTREE_PAGE_SIZE * (ptr - start)
+			return chunk[offset : offset+BTREE_PAGE_SIZE]
+		}
+		start = end
+	}
+	panic("bad ptr")
+}
