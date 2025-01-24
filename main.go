@@ -950,3 +950,83 @@ func dbUpdate(db *DB, tdef *TableDef, rec Record, mode int) (bool, error) {
 	val := encodeValues(nil, values[tdef.PKeys:])
 	return db.kv.Update(key, val, mode)
 }
+
+type BIter struct {
+	tree *Btree
+	path []BNode // from root to leaf
+	pos  []uint16
+}
+
+// find the closest position that is less or equal to the input key
+func (tree *Btree) SeekLE(key []byte) *BIter
+
+// getthecurrentKVpair
+func (iter *BIter) Deref() ([]byte, []byte)
+
+// preconditionoftheDeref()
+func (iter *BIter) Valid() bool
+
+// movingbackwardandforward
+func (iter *BIter) Prev()
+func (iter *BIter) Next() {
+	iterNext(iter, len(iter.path)-1)
+}
+
+func iterNext(iter *BIter, level int) {
+	if iter.pos[level]+1 < iter.path[level].nkeys() {
+		iter.pos[level]++ // move within this node
+	} else if level > 0 {
+		iterNext(iter, level-1) // move to a sibling node
+	} else {
+		iter.pos[len(iter.pos)-1]++ // past the last key
+		return
+	}
+
+	if level+1 < len(iter.pos) { // update the child node
+		node := iter.path[level]
+		kid := BNode(iter.tree.get(node.getPtr(iter.pos[level])))
+		iter.path[level+1] = kid
+		iter.pos[level+1] = 0
+	}
+}
+
+func (tree *Btree) SeekLE(key []byte) *BIter {
+	iter := &BIter{tree: tree}
+	for ptr := tree.root; ptr != 0; {
+		node := tree.get(ptr)
+		idx := nodeLookupLE(node, key)
+		iter.path = append(iter.path, node)
+		iter.pos = append(iter.pos, idx)
+		ptr = node.getPtr(idx)
+	}
+	return iter
+}
+
+const (
+	CMP_GE = +3 // >=
+	CMP_GT = +2 // >
+	CMP_LT = -2 // <
+	CMP_LE = -3 // <=
+)
+
+func (tree *Btree) Seek(key []byte, cmp int) *BIter
+
+// Scanner is a wrapper of B+Tree iterator, it decodes KVs into rows
+// within the range or not?
+func (sc *Scanner) Valid() bool
+
+// move the underlying B-tree iterator
+func (sc *Scanner) Next()
+
+// fetch the current row
+func (sc *Scanner) Deref(rec *Record)
+func (db *DB) Scan(table string, req *Scanner) error
+
+type Scanner struct {
+	// the range, from Key1 to Key2
+	Cmp1 int // CMP_??
+	Cmp2 int
+	Key1 Record
+	Key2 Record
+	// ...
+}
