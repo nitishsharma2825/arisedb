@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"path"
+	"slices"
 	"syscall"
 )
 
@@ -833,10 +834,10 @@ func (rec *Record) Get(col string) *Value {
 
 type TableDef struct {
 	// user defined
-	Name  string
-	Types []uint32 // col types
-	Cols  []string // col names
-	PKeys int      // the first `PKeys` columns are the primary key
+	Name    string
+	Types   []uint32   // col types
+	Cols    []string   // col names
+	Indexes [][]string // the first index is the primary key
 	// auto-assigned B-tree key prefixes for different tables
 	Prefix uint32
 }
@@ -932,7 +933,9 @@ const (
 type UpdateReq struct {
 	tree *Btree
 	// out
-	Added bool // added a new key
+	Added   bool   // added a new key
+	Updated bool   // added a new key or an old key was changed
+	Old     []byte // the value before the update
 	// in
 	Key  []byte
 	Val  []byte
@@ -948,7 +951,19 @@ func dbUpdate(db *DB, tdef *TableDef, rec Record, mode int) (bool, error) {
 	}
 	key := encodeKey(nil, tdef.Prefix, values[:tdef.PKeys])
 	val := encodeValues(nil, values[tdef.PKeys:])
-	return db.kv.Update(key, val, mode)
+	// insert the row
+	req := UpdateReq{Key: key, Val: val, Mode: mode}
+	if _, err = db.kv.Update(&req); err != nil {
+		return false, err
+	}
+	// maintain secondary indexes
+	if req.Updated && !req.Added {
+		// use `req.Old` to delete the old indexed keys ...
+	}
+	if req.Updated {
+		// add the new indexed keys ...
+	}
+	return req.Updated, nil
 }
 
 type BIter struct {
@@ -1028,5 +1043,59 @@ type Scanner struct {
 	Cmp2 int
 	Key1 Record
 	Key2 Record
-	// ...
+	// internal
+	db     *DB
+	tdef   *TableDef
+	index  int    // which index?
+	iter   *BIter // the underlying B-tree iterator
+	keyEnd []byte // the encoded key2
+}
+
+func dbScan(db *DB, tdef *TableDef, req *Scanner) error {
+	isCovered := func(index []string) {
+		key := req.Key1.Cols
+		return len(index) >= len(key) && slices.Equal(index[:len(key)], key)
+	}
+	req.index = slices.IndexFunc(tdef.Indexes, isCovered)
+}
+
+func encodeValues(out []byte, vals []Value) []byte {
+	for _, v := range vals {
+		out = append(out, byte(v.Type)) // *added*: doesn't start with 0xff
+		switch v.Type {
+		case TYPE_INT64:
+			var buf [8]byte
+			u := uint64(v.I64) + (1 << 63)
+			// flip the sign bit
+			binary.BigEndian.PutUint64(buf[:], u) // big endian
+			out = append(out, buf[:]...)
+		case TYPE_BYTES:
+			out = append(out, escapeString(v.Str)...)
+			out = append(out, 0) // null-terminated
+		default:
+			panic("what?")
+		}
+	}
+}
+
+// for primary keys and indexes
+func encodeKey(out []byte, prefixuint32, vals []Value) []byte {
+	//4-byte table prefix
+	var buf [4]byte
+	binary.BigEndian.PutUint32(buf[:], prefix)
+	out = append(out, buf[:]...)
+	//order-preserving encoded keys
+	out = encodeValues(out, vals)
+	returnout
+}
+
+// for the input range, which can be a prefix of the index key.
+func encodeKeyPartial(
+	out []byte, prefixuint32, vals []Value, cmp int,
+) []byte {
+	out = encodeKey(out, prefix, vals)
+	if cmp == CMP_GT || cmp == CMP_LE { //encode missing columns as infinity
+		out = append(out, 0xff) // unreachable+infinity
+	} //else:-infinity is the empty string
+	return out
 }
