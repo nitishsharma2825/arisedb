@@ -868,7 +868,14 @@ func (db *DB) Get(table string, rec *Record) (bool, error) {
 }
 
 func (db *DB) Insert(tablestring, recRecord) (bool, error)
-func (db *DB) Update(tablestring, recRecord) (bool, error)
+func (db *DB) Update(tablestring, recRecord) (bool, error) {
+	meta := saveMeta(db)
+	if !db.tree.Update(req) {
+		return false, nil
+	}
+	err := updateOrRevert(db, meta)
+	return err == nil, err
+}
 func (db *DB) Upsert(tablestring, recRecord) (bool, error)
 func (db *DB) Delete(tablestring, recRecord) (bool, error)
 
@@ -1099,3 +1106,53 @@ func encodeKeyPartial(
 	} //else:-infinity is the empty string
 	return out
 }
+
+type KVTX struct {
+	db   *KV
+	meta []byte // for the rollback
+}
+
+// begin a transaction
+func (kv *KV) Begin(tx *KVTX) {
+	tx.db = kv
+	tx.meta = saveMeta(tx.db)
+}
+
+// end a transaction: commit updates; rollback on error
+func (kv *KV) Commit(tx *KVTX) error {
+	return updateOrRevert(tx.db, tx.meta)
+}
+
+// end a transaction: rollback
+func (kv *KV) Abort(tx *KVTX) {
+	// nothing has written, just revert the in-memory states
+	loadMeta(tx.db, tx.meta)
+	// discard temporaries
+	tx.db.page.nappend = 0
+	tx.db.page.updates = map[uint64]byte{}
+}
+
+func (tx *KVTX) Seek(key []byte, cmp int) *BIter {
+	return tx.db.tree.Seek(key, cmp)
+}
+
+func (tx *KVTX) Update(req *UpdateReq) bool {
+	return tx.db.tree.Update(req)
+}
+
+func (tx *KVTX) Del(req *DeleteReq) bool {
+	return tx.db.tree.Delete(req)
+}
+
+type DBTX struct {
+	kv KVTX
+	db *DB
+}
+
+func (db *DB) Begin(tx *DBTX)
+func (db *DB) Commit(tx *DBTX) error
+func (db *DB) Abort(tx *DBTX)
+
+func (tx *DBTX) Scan(table string, req *Scanner) error
+func (tx *DBTX) Set(table string, rec Record, mode int) (bool, error)
+func (tx *DBTX) Delete(table string, rec Record) (bool, error)
