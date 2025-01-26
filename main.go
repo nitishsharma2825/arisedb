@@ -485,6 +485,8 @@ type KV struct {
 		updates map[uint64]byte // pending updates, including appended pages
 	}
 	failed bool // Did the last update failed?
+	version uint64 	// monotonic version number; persisted in the meta page
+	ongoing []uint64	// version numbers of concurrent TXs
 }
 
 // Btree.get, read a page
@@ -698,6 +700,8 @@ type FreeList struct {
 	tailSeq  uint64 // monotonic seq number to index into the list tail
 	// in-memory states
 	maxSeq uint64 // saved 'tailSeq' to prevent consuming newly added items
+	maxVer uint64 // the oldest reader version
+	curVer uint64 // version number when committing
 }
 
 // get 1 item from the list head. return 0 on failure
@@ -1108,14 +1112,29 @@ func encodeKeyPartial(
 }
 
 type KVTX struct {
-	db   *KV
-	meta []byte // for the rollback
+	// a read only snapshot
+	snapshot Btree
+	version uint64
+	// captured KV updates
+	// values are prefixed by a 1-byte flag to indicate deleted keys
+	pending Btree
+	db      *KV
+	meta    []byte // for the rollback
 }
 
 // begin a transaction
 func (kv *KV) Begin(tx *KVTX) {
-	tx.db = kv
-	tx.meta = saveMeta(tx.db)
+	// read-only snapshot, just the tree root and the page read callback
+	tx.snapshot.root = kv.tree.root
+	tx.snapshot.get = ... // read from mmap'ed pages...
+	// in memory tree to capture updates
+	pages := [][]byte(nil)
+	tx.pending.get = func(u uint64) []byte {return pages[ptr-1]}
+	tx.pending.new = func(node []byte) uint64 {
+		pages = append(pages, node)
+		return uint64(len(pages))
+	}
+	tx.pending.del = func(uint64) {}
 }
 
 // end a transaction: commit updates; rollback on error
@@ -1144,6 +1163,20 @@ func (tx *KVTX) Del(req *DeleteReq) bool {
 	return tx.db.tree.Delete(req)
 }
 
+func (tx *KVTX) Get(key []byte) ([]byte, bool) {
+	val, ok := tx.pending.Get(key)
+	switch {
+	case ok && val[0] == FLAG_UPDATED: // updated in this TX
+		return val[1:], true
+	case ok && val[0] == FLAG_DELETED: // deleted in this TX
+		return nil, false
+	case !ok: // read from the snapshot
+		return tx.snapshot.Get(key)
+	default:
+		panic("unreachable")
+	}
+}
+
 type DBTX struct {
 	kv KVTX
 	db *DB
@@ -1156,3 +1189,26 @@ func (db *DB) Abort(tx *DBTX)
 func (tx *DBTX) Scan(table string, req *Scanner) error
 func (tx *DBTX) Set(table string, rec Record, mode int) (bool, error)
 func (tx *DBTX) Delete(table string, rec Record) (bool, error)
+
+// an iterator that combines pending updates and the snapshot
+type CombinedIter struct {
+	top *BIter // KVTX.pending
+	bot *BIter // KVTX.snapshot
+	// ...
+}
+
+//start <=key<=stop
+type KeyRange struct{
+	start []byte
+	stop []byte
+}
+
+type KVTXstruct{
+	//...
+	reads []KeyRange
+}
+
+func (tx*KVTX) Get(key []byte)([]byte, bool) {
+	tx.reads = append(tx.reads,KeyRange{key, key})//dependency
+	//...
+}
